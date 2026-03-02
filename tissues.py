@@ -408,8 +408,8 @@ class Example:
         builder.default_particle_radius = 0.01
 
         # Tissue dimensions - a visible slab of meat
-        dim_x, dim_y, dim_z = 20, 8, 20  # cells (width, height, depth)
-        cell_size = 0.03  # 3cm per cell -> 60cm x 24cm x 60cm slab
+        dim_x, dim_y, dim_z = 12, 6, 12  # cells (width, height, depth)
+        cell_size = 0.025  # 2.5cm per cell -> 30cm x 15cm x 30cm slab
 
         # Calculate particle density from material density
         total_volume = (dim_x * cell_size) * (dim_y * cell_size) * (dim_z * cell_size)
