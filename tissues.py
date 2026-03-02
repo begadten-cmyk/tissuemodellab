@@ -409,7 +409,7 @@ class Example:
 
         # Tissue dimensions - a visible slab of meat
         dim_x, dim_y, dim_z = 10, 4, 10  # cells (width, height, depth)
-        cell_size = 0.025  # 2.5cm per cell -> 30cm x 15cm x 30cm slab
+        cell_size = 0.06  # 6cm per cell -> 30cm x 15cm x 30cm slab
 
         # Calculate particle density from material density
         total_volume = (dim_x * cell_size) * (dim_y * cell_size) * (dim_z * cell_size)
