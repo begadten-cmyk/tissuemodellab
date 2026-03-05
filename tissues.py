@@ -384,9 +384,6 @@ class Example:
                  surface_template=None, surface_direction="X",
                  surface_params=None, surface_preview=False):
         # Simulation parameters
-        # Higher Poisson ratios produce stiffer volumetric forces (k_lambda),
-        # requiring smaller dt for semi-implicit stability. At nu=0.495 with
-        # E=15kPa, k_lambda ~ 150kPa, so we need more substeps than typical.
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
@@ -407,25 +404,47 @@ class Example:
         builder = newton.ModelBuilder()
         builder.default_particle_radius = 0.01
 
-        # Tissue dimensions - a visible slab of meat
-        dim_x, dim_y, dim_z = 10, 4, 10  # cells (width, height, depth)
-        cell_size = 0.06  # 6cm per cell -> 30cm x 15cm x 30cm slab
+        # ---- WORLD SIZE: target physical dimensions ----
+        # These match the slab visible in the reference video.
+        target_x = 0.60   # meters  (world X width)
+        target_y = 0.60   # meters  (world Y depth)
+        target_z = 0.24   # meters  (world Z height)
+        cell_size = 0.03  # 3 cm per cell → good surface resolution
+
+        # Grid dims.
+        # The grid is built with a -90° rotation around X, so:
+        #   grid X (dim_x) → world X
+        #   grid Y (dim_y) → world Z (height)
+        #   grid Z (dim_z) → world Y (depth)
+        dim_x = max(1, round(target_x / cell_size))   # 20
+        dim_y = max(1, round(target_z / cell_size))   # 8   (thin/height dimension)
+        dim_z = max(1, round(target_y / cell_size))   # 20
+
+        # Enforce particle cap ≤35k
+        num_particles = (dim_x + 1) * (dim_y + 1) * (dim_z + 1)
+        while num_particles > 35_000 and cell_size < 0.20:
+            cell_size *= 1.1
+            dim_x = max(1, round(target_x / cell_size))
+            dim_y = max(1, round(target_z / cell_size))
+            dim_z = max(1, round(target_y / cell_size))
+            num_particles = (dim_x + 1) * (dim_y + 1) * (dim_z + 1)
+
+        # Physical extents of the grid in its LOCAL frame
+        tissue_width  = dim_x * cell_size   # world X span
+        tissue_height = dim_y * cell_size   # world Z span (after rotation)
+        tissue_depth  = dim_z * cell_size   # world Y span (after rotation)
 
         # Calculate particle density from material density
-        total_volume = (dim_x * cell_size) * (dim_y * cell_size) * (dim_z * cell_size)
+        total_volume = tissue_width * tissue_height * tissue_depth
         total_mass = props["density"] * total_volume
-        num_particles = (dim_x + 1) * (dim_y + 1) * (dim_z + 1)
         particle_mass = total_mass / num_particles
         cell_volume = cell_size ** 3
         particle_density = particle_mass / cell_volume
 
-        # Position: centered in x/y, sitting on ground (z=0)
-        tissue_width = dim_x * cell_size
-        tissue_depth = dim_z * cell_size
-
-        # Add soft tissue grid (tetrahedral FEM)
-        # Rotate to lie flat (thin dimension becomes vertical)
-        tissue_height = dim_y * cell_size
+        # Add soft tissue grid (tetrahedral FEM).
+        # Rotate -90° around X so the thin dim_y dimension becomes the vertical height.
+        # pos offsets center the slab in X/Z-grid and raise it by tissue_height so
+        # the rotated bottom lands at z=0.
         builder.add_soft_grid(
             pos=wp.vec3(-tissue_width / 2, -tissue_depth / 2, tissue_height),
             rot=wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), -wp.pi / 2.0),
@@ -445,7 +464,7 @@ class Example:
             tri_kd=0.0,
             tri_drag=0.0,
             tri_lift=0.0,
-            fix_top=True,  # After -90° rotation, grid top = world bottom (z=0)
+            fix_top=True,  # After -90° rotation, grid top (j=dim_y) = world bottom (z=0)
         )
 
         # Add ground plane with soft contact properties
@@ -457,17 +476,10 @@ class Example:
             cfg=newton.ModelBuilder.ShapeConfig(ke=ke, kd=kd, kf=kf, mu=mu)
         )
 
-        # Probe: sphere pressed down onto tissue (like a finger tip)
-        self.probe_radius = 0.02  # 2cm sphere
-        self.probe_surface_z = tissue_height + self.probe_radius
-        self.probe_rest_z = self.probe_surface_z + 0.03  # hover 3cm above
-        self.probe_z = self.probe_rest_z
-
+        # Probe: placeholder position — corrected after bbox computation below
+        self.probe_radius = 0.02  # 2 cm sphere
         self.probe_id = builder.add_body(
-            xform=wp.transform(
-                p=wp.vec3(0.0, 0.0, self.probe_rest_z),
-                q=wp.quat_identity(),
-            ),
+            xform=wp.transform(p=wp.vec3(0.0, 0.0, 1.0), q=wp.quat_identity()),
         )
         builder.add_shape_sphere(
             self.probe_id,
@@ -506,6 +518,52 @@ class Example:
             # Recompute FEM rest poses so displaced shape is stress-free
             _recompute_tet_poses(self.model, self.state_0)
 
+        # ---- PLACEMENT: bbox-based translation ----
+        # Translate ALL particles so:
+        #   bbox_min.z = 0.02  (just above ground)
+        #   bbox center.y = 1.0  (tissue away from origin so camera won't spawn inside)
+        device = self.state_0.particle_q.device
+        q0 = self.state_0.particle_q.numpy()
+        q1 = self.state_1.particle_q.numpy()
+
+        bbox_min0 = q0.min(axis=0)
+        bbox_max0 = q0.max(axis=0)
+
+        tz = 0.02 - float(bbox_min0[2])
+        cy_current = float((bbox_min0[1] + bbox_max0[1]) / 2.0)
+        ty = 1.0 - cy_current
+        translation = np.array([0.0, ty, tz], dtype=np.float32)
+
+        q0 += translation
+        q1 += translation
+
+        wp.copy(self.state_0.particle_q, wp.array(q0, dtype=wp.vec3, device=device))
+        wp.copy(self.state_1.particle_q, wp.array(q1, dtype=wp.vec3, device=device))
+
+        # Recompute bbox after translation
+        bbox_min = q0.min(axis=0)
+        bbox_max = q0.max(axis=0)
+        dx_span = float(bbox_max[0] - bbox_min[0])
+        dy_span = float(bbox_max[1] - bbox_min[1])
+        dz_span = float(bbox_max[2] - bbox_min[2])
+        cx = float((bbox_min[0] + bbox_max[0]) / 2.0)
+        cy = float((bbox_min[1] + bbox_max[1]) / 2.0)
+
+        # Probe placement derived from bbox
+        self.probe_xy = (cx, cy)
+        self.probe_surface_z = float(bbox_max[2]) + self.probe_radius
+        self.probe_rest_z = self.probe_surface_z + 0.03   # hover 3 cm above
+        self.probe_z = self.probe_rest_z
+
+        # Initialise probe body to correct world position in both states
+        probe_init_pos = wp.vec3(cx, cy, self.probe_rest_z)
+        wp.launch(set_probe_kinematic, dim=1,
+                  inputs=[self.state_0.body_q, self.state_0.body_qd,
+                          self.probe_id, probe_init_pos])
+        wp.launch(set_probe_kinematic, dim=1,
+                  inputs=[self.state_1.body_q, self.state_1.body_qd,
+                          self.probe_id, probe_init_pos])
+
         self.control = self.model.control()
         self.contacts = self.model.collide(self.state_0, soft_contact_margin=0.02)
 
@@ -515,9 +573,8 @@ class Example:
         self.depth_index = 2  # Start at 10mm
 
         # Find initial top surface for deformation measurement
-        q = self.state_0.particle_q.numpy()
-        self.initial_top_z = float(q[:, 2].max())
-        top_mask = q[:, 2] > (self.initial_top_z - 0.01)
+        self.initial_top_z = float(bbox_max[2])
+        top_mask = q0[:, 2] > (self.initial_top_z - 0.01)
         self.top_particle_indices = np.where(top_mask)[0]
 
         # Key state tracking for press detection
@@ -527,19 +584,26 @@ class Example:
         # Setup viewer
         self.viewer.set_model(self.model)
 
-        # Print info
+        # ---- Required diagnostics ----
         gamma = 1.0 + k_mu / k_lambda - k_mu / (4.0 * k_lambda)
         print(f"Tissue Simulation:")
-        print(f"  Type:           {tissue_type}")
-        print(f"  Particles:      {self.model.particle_count}")
-        print(f"  Tetrahedra:     {self.model.tet_count}")
-        print(f"  E (Young's):    {props['young_modulus']:,.0f} Pa")
-        print(f"  nu (Poisson):   {props['poisson_ratio']}")
-        print(f"  k_mu (shear):   {k_mu:,.1f} Pa")
-        print(f"  k_lambda (bulk):{k_lambda:,.1f} Pa")
-        print(f"  gamma (rest):   {gamma:.4f}")
-        print(f"  Substeps:       {self.sim_substeps}")
-        print(f"  dt:             {self.sim_dt:.6f} s")
+        print(f"  Type:              {tissue_type}")
+        print(f"  cell_size:         {cell_size:.4f} m")
+        print(f"  dim_x/dim_y/dim_z: {dim_x}/{dim_y}/{dim_z}")
+        print(f"  particle_count:    {self.model.particle_count}")
+        print(f"  Tetrahedra:        {self.model.tet_count}")
+        print(f"  bbox_min:          ({bbox_min[0]:.3f}, {bbox_min[1]:.3f}, {bbox_min[2]:.3f})")
+        print(f"  bbox_max:          ({bbox_max[0]:.3f}, {bbox_max[1]:.3f}, {bbox_max[2]:.3f})")
+        print(f"  spans (dx,dy,dz):  ({dx_span:.3f}, {dy_span:.3f}, {dz_span:.3f})")
+        print(f"  probe_xy:          ({cx:.3f}, {cy:.3f})")
+        print(f"  probe_rest_z:      {self.probe_rest_z:.3f} m")
+        print(f"  E (Young's):       {props['young_modulus']:,.0f} Pa")
+        print(f"  nu (Poisson):      {props['poisson_ratio']}")
+        print(f"  k_mu (shear):      {k_mu:,.1f} Pa")
+        print(f"  k_lambda (bulk):   {k_lambda:,.1f} Pa")
+        print(f"  gamma (rest):      {gamma:.4f}")
+        print(f"  Substeps:          {self.sim_substeps}")
+        print(f"  dt:                {self.sim_dt:.6f} s")
         print(f"\nControls:")
         print(f"  P          Toggle probe down/up")
         print(f"  UP/DOWN    Change probe depth")
@@ -554,7 +618,7 @@ class Example:
 
     def simulate(self):
         """Run simulation substeps."""
-        probe_pos = wp.vec3(0.0, 0.0, self.probe_z)
+        probe_pos = wp.vec3(self.probe_xy[0], self.probe_xy[1], self.probe_z)
 
         # Contact force scales with probe penetration into tissue
         probe_bottom = self.probe_z - self.probe_radius
@@ -662,13 +726,13 @@ class Example:
         self._prev_keys = keys
 
     def _measure_deformation(self):
-        """Measure indentation depth (mm) of top surface near probe."""
+        """Measure indentation depth (mm) of top surface near probe center."""
         q = self.state_0.particle_q.numpy()
         top_q = q[self.top_particle_indices]
 
-        # Particles near probe center (x=0, y=0)
+        cx, cy = self.probe_xy
         measure_radius = self.probe_radius * 3.0
-        dist_sq = top_q[:, 0] ** 2 + top_q[:, 1] ** 2
+        dist_sq = (top_q[:, 0] - cx) ** 2 + (top_q[:, 1] - cy) ** 2
         near_probe = dist_sq < measure_radius ** 2
 
         if near_probe.any():
